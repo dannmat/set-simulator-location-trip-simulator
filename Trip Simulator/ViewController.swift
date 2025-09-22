@@ -74,20 +74,29 @@ class ViewController: NSViewController, NSComboBoxDelegate {
                 return
             }
             
-            // Assume LineString GeoJSON for simplicity
             if let features = json["features"] as? [[String: Any]],
                let geometry = features.first?["geometry"] as? [String: Any],
                let coords = geometry["coordinates"] as? [[Double]] {
-                
+
                 geoJSONCoordinates = coords.map { CLLocationCoordinate2D(latitude: $0[1], longitude: $0[0]) }
-                
-                // draw polyline on map
+
+                // Remove any existing polylines (both MKRoute polyline & GeoJSON polyline)
+                let existingOverlays = mapView.overlays
+                mapView.removeOverlays(existingOverlays)
+
+                // draw new polyline on map
                 let polyline = MKPolyline(coordinates: geoJSONCoordinates, count: geoJSONCoordinates.count)
                 mapView.addOverlay(polyline)
                 mapView.setVisibleMapRect(polyline.boundingMapRect,
                                           edgePadding: NSEdgeInsets(top: 50, left: 50, bottom: 50, right: 50),
                                           animated: true)
-                
+
+                // Reset and add movable annotation
+                currentAnnotation.coordinate = geoJSONCoordinates.first ?? CLLocationCoordinate2D(latitude: 0, longitude: 0)
+                if !mapView.annotations.contains(where: { $0 === currentAnnotation }) {
+                    mapView.addAnnotation(currentAnnotation)
+                }
+
                 usingGeoJSONRoute = true
                 simulateButton.isEnabled = true
                 speedOutlet.isEnabled = true
@@ -336,9 +345,18 @@ class ViewController: NSViewController, NSComboBoxDelegate {
     }
     
     @IBAction func startSimulationAction(_ sender: Any) {
-        print("Start Simulation pressed")
+        if simulating {
+            // Stop the simulation
+            simulating = false
+            DispatchQueue.main.async {
+                self.simulateButton.title = "Start Simulation"
+                self.simulateButton.state = .off
+                self.statusOutlet.stringValue = "Simulation stopped."
+            }
+            return
+        }
 
-        // Reset state
+        // Otherwise, start simulation
         simulating = true
         stepNum = 0
 
@@ -356,13 +374,11 @@ class ViewController: NSViewController, NSComboBoxDelegate {
             prepareStepsFromMKRoute()
         }
 
-        // Kick off simulation in the background
         simulationQueue.async {
             self.simulateMovement()
         }
 
         DispatchQueue.main.async {
-            self.simulateButton.isEnabled = true
             self.simulateButton.title = "Stop Simulation"
             self.simulateButton.state = .on
             self.statusOutlet.stringValue = "Simulation started."
