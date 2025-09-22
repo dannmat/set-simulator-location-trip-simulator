@@ -49,6 +49,57 @@ class ViewController: NSViewController, NSComboBoxDelegate {
     @IBOutlet var tableScrollView: NSScrollView!
     @IBOutlet var statusOutlet: NSTextField!
     
+    //GeoJSON properties
+    private var geoJSONCoordinates: [CLLocationCoordinate2D] = []
+    private var usingGeoJSONRoute = false
+    
+    @IBAction func geoJSONAction(_ sender: Any) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedFileTypes = ["geojson", "json"]
+        panel.title = "Choose a GeoJSON file"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            loadGeoJSON(from: url)
+        }
+    }
+    
+    private func loadGeoJSON(from url: URL) {
+        do {
+            let data = try Data(contentsOf: url)
+            guard let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
+                print("Invalid JSON structure")
+                return
+            }
+            
+            // Assume LineString GeoJSON for simplicity
+            if let features = json["features"] as? [[String: Any]],
+               let geometry = features.first?["geometry"] as? [String: Any],
+               let coords = geometry["coordinates"] as? [[Double]] {
+                
+                geoJSONCoordinates = coords.map { CLLocationCoordinate2D(latitude: $0[1], longitude: $0[0]) }
+                
+                // draw polyline on map
+                let polyline = MKPolyline(coordinates: geoJSONCoordinates, count: geoJSONCoordinates.count)
+                mapView.addOverlay(polyline)
+                mapView.setVisibleMapRect(polyline.boundingMapRect,
+                                          edgePadding: NSEdgeInsets(top: 50, left: 50, bottom: 50, right: 50),
+                                          animated: true)
+                
+                usingGeoJSONRoute = true
+                simulateButton.isEnabled = true
+                speedOutlet.isEnabled = true
+                statusOutlet.stringValue = "GeoJSON route loaded with \(geoJSONCoordinates.count) points"
+            } else {
+                print("Unsupported GeoJSON structure")
+            }
+        } catch {
+            print("Failed to load file: \(error.localizedDescription)")
+        }
+    }
+    
     @IBAction func tableAction(_ sender: Any) {
 
         let tableView = sender as! NSTableView
@@ -150,6 +201,19 @@ class ViewController: NSViewController, NSComboBoxDelegate {
         
         print("Route button pressed")
         
+        if usingGeoJSONRoute {
+            // If we already loaded GeoJSON, don’t call MKDirections
+            if !geoJSONCoordinates.isEmpty {
+                let polyline = MKPolyline(coordinates: geoJSONCoordinates, count: geoJSONCoordinates.count)
+                mapView.addOverlay(polyline)
+                simulateButton.isEnabled = true
+                speedOutlet.isEnabled = true
+                statusOutlet.stringValue = "GeoJSON route ready. \(geoJSONCoordinates.count) points."
+            }
+            return
+        }
+        
+        
         if self.route != nil {        // clear overlay
             self.mapView.removeOverlay(self.route.polyline)
         }
@@ -201,81 +265,108 @@ class ViewController: NSViewController, NSComboBoxDelegate {
                 self.statusOutlet.stringValue = "Route generated. Trip duration = \(durationInMin) min."
                 self.simulateButton.isHighlighted = true
             }
+        }
+    }
+    
+    private func prepareStepsFromGeoJSON() {
+        allSteps.removeAll()
+        allDurations.removeAll()
 
+        var totalDuration = 0.0
+        for i in 0..<geoJSONCoordinates.count {
+            let point = MKMapPoint(geoJSONCoordinates[i])
+            if i > 0 {
+                let prev = MKMapPoint(geoJSONCoordinates[i-1])
+                let dist = point.distance(to: prev)
+                let duration = dist / 15.0 // assume ~15 m/s ≈ 54 km/h (tweakable)
+                allDurations.append(duration)
+                totalDuration += duration
+            } else {
+                allDurations.append(0)
+            }
+            allSteps.append(point)
+        }
+        statusOutlet.stringValue = "GeoJSON simulation prepared. Duration ≈ \(round(totalDuration/60)) min."
+    }
+    
+    private func prepareStepsFromMKRoute() {
+        allSteps.removeAll()
+        allDurations.removeAll()
+
+        guard let route = route else {
+            print("No MKRoute available")
+            return
         }
 
-    }
+        var totalDuration: TimeInterval = 0.0
 
+        for step in route.steps {
+            // Extract coordinates from the step polyline
+            var coordinates: [CLLocationCoordinate2D] = Array(
+                repeating: kCLLocationCoordinate2DInvalid,
+                count: step.polyline.pointCount
+            )
+            step.polyline.getCoordinates(&coordinates,
+                                         range: NSRange(location: 0,
+                                                        length: step.polyline.pointCount))
+
+            // Convert to MKMapPoints
+            let points = coordinates.map { MKMapPoint($0) }
+
+            // For each segment between points, calculate distance + duration
+            for i in 0..<points.count {
+                let point = points[i]
+                allSteps.append(point)
+
+                if i > 0 {
+                    let prev = points[i-1]
+                    let dist = point.distance(to: prev)
+
+                    // Proportional duration based on route expectedTravelTime
+                    let duration = (dist / route.distance) * route.expectedTravelTime
+                    allDurations.append(duration)
+                    totalDuration += duration
+                } else {
+                    allDurations.append(0)
+                }
+            }
+        }
+
+        print("MKRoute simulation prepared: \(allSteps.count) steps, duration ~\(round(totalDuration/60)) min.")
+    }
     
     @IBAction func startSimulationAction(_ sender: Any) {
-        
-        // prepare step array with duration for playback
-        
-        if (simulating) {
-            
-            simulating = false
-            simulateButton.state = NSControl.StateValue.off
-            simulateButton.title = "Start Simulation"
-            fromOutlet.isEnabled = true
-            toOutlet.isEnabled = true
-            generateButton.isEnabled = true
-            currentAnnotationView.isEnabled = false
-            
+        print("Start Simulation pressed")
+
+        // Reset state
+        simulating = true
+        stepNum = 0
+
+        if usingGeoJSONRoute {
+            if geoJSONCoordinates.isEmpty {
+                statusOutlet.stringValue = "No GeoJSON route loaded."
+                return
+            }
+            prepareStepsFromGeoJSON()
         } else {
-            
-            simulateButton.state = NSControl.StateValue.on
-            currentAnnotationView.isEnabled = true
-            simulateButton.title = "Stop Simulation"
-            self.generateButton.isEnabled = true
-            
-            var totalDuration = 0.0
-            allDurations.removeAll()
-            allSteps.removeAll()
-            
-            for step in route.steps {
-                
-                var coordinates: [CLLocationCoordinate2D] = Array(repeating: kCLLocationCoordinate2DInvalid, count: step.polyline.pointCount)
-                step.polyline.getCoordinates(&coordinates, range: NSRange(location: 0, length: step.polyline.pointCount))
-                var totalDistance = 0.0
-                
-                // calculate total distance to determine percentage completion
-                for i in 0..<step.polyline.pointCount {
-                    let coord = coordinates[i]
-                    if (i > 0) {
-                        totalDistance += (coord.distance(from: coordinates[i-1]))
-                    }
-                }
-
-                if (totalDistance > 0) {
-                    let stepPoints = step.polyline.points()
-                    for i in 0..<step.polyline.pointCount {
-                        let stepPoint = stepPoints[i]
-                        let pointDistance = stepPoint.distance(to: allSteps.last ?? stepPoint)
-                        let pointDuration = (pointDistance / totalDistance) * (step.distance / route.distance) * route.expectedTravelTime
-                        print("\(i): \(pointDuration) seconds, \(pointDistance)")
-                        allDurations.append(pointDuration)
-                        allSteps.append(stepPoint)
-                        totalDuration += pointDuration
-                    }
-                }
-                
+            guard route != nil else {
+                statusOutlet.stringValue = "No MKRoute to simulate."
+                return
             }
-            print("Total Duration = \(round(totalDuration/60)) for \(allSteps.count) steps")
-            
-            // run simulation on a dedicated thread
-            self.fromOutlet.isEnabled = false
-            self.toOutlet.isEnabled = false
-            self.generateButton.isEnabled = false
-
-            simulationQueue.async{
-                self.simulateMovement()
-            }
+            prepareStepsFromMKRoute()
         }
-        tableScrollView.isHidden = true         // clean up
-        fromOutlet.isEnabled = true
-        toOutlet.isEnabled = true
-        generateButton.isEnabled = true
 
+        // Kick off simulation in the background
+        simulationQueue.async {
+            self.simulateMovement()
+        }
+
+        DispatchQueue.main.async {
+            self.simulateButton.isEnabled = true
+            self.simulateButton.title = "Stop Simulation"
+            self.simulateButton.state = .on
+            self.statusOutlet.stringValue = "Simulation started."
+        }
     }
     
     func simulateMovement() {
